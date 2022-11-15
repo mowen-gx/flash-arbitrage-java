@@ -76,37 +76,52 @@ public class TransactionHandler extends WebSocketClient {
     }
 
     /**
-     * 订阅PendingTxs
+     * 订阅Pending的交易
      */
     public void subscribePendingTxs() {
         HashMap<String, Object> param = new HashMap<>();
         param.put("params", Arrays.asList("newPendingTransactions"));
         param.put("id", "eth_subscribe_newPendingTransactions");
         param.put("method", "eth_subscribe");
+        log.info("订阅Pending的交易");
         send(JSON.toJSONString(param));
     }
 
+    /**
+     * WebSocket连接打开事件
+     * @param data 数据
+     */
     @Override
     public void onOpen(ServerHandshake data) {
+        //启动订阅待完成的交易信息
         subscribePendingTxs();
     }
 
+    /**
+     * WebSocket的消息事件
+     * @param message 消息实体
+     */
     @Override
     public void onMessage(String message) {
+        //解析消息实体
         JSONObject result = JSON.parseObject(message);
         if (result.containsKey("id")) {
+            //当前消息是否为待完成交易
             if ("eth_subscribe_newPendingTransactions".equals(result.get("id"))) {
                 newPendingTransactionsKey = result.getString("result");
             }
         }
+
         if (result.containsKey("method") && "eth_subscription".equals(result.getString("method"))) {
             JSONObject params = result.getJSONObject("params");
+            //当前消息内容是否为订阅
             if (newPendingTransactionsKey.equals(params.getString("subscription"))) {
-//                try {
-//                    handlerNewTxs(params.getString("result"));
-//                } catch (IOException e) {
-//                    log.error("", e);
-//                }
+                try {
+                    //处理新交易信息
+                    handlerNewTxs(params.getString("result"));
+                } catch (IOException e) {
+                    log.error("handlerNewTxs发生异常", e);
+                }
                 //提交到线程池
                 transactionHandlerExecutor.execute(() -> {
                     try {
@@ -119,14 +134,24 @@ public class TransactionHandler extends WebSocketClient {
         }
     }
 
+    /**
+     * WebSocket的连接关闭事件
+     * @param code 到吗
+     * @param reason 原因
+     * @param remote
+     */
     @Override
     public void onClose(int code, String reason, boolean remote) {
-
+        log.info("TransactionHandler.close");
     }
 
+    /**
+     * WebSocket的错误事件
+     * @param ex 异常信息
+     */
     @Override
     public void onError(Exception ex) {
-
+        log.error("TransactionHandler.error", ex);
     }
 
     /**
@@ -136,20 +161,18 @@ public class TransactionHandler extends WebSocketClient {
     public void heartBeat() throws InterruptedException {
         if (getReadyState() == READYSTATE.OPEN) {
         } else if (getReadyState() == READYSTATE.NOT_YET_CONNECTED) {
-            log.info("未连接重连");
             if (isClosed()) {
                 reconnectBlocking();
             } else {
                 connectBlocking();
             }
         } else if (getReadyState() == READYSTATE.CLOSED) {
-            log.info("已关闭重连");
             reconnectBlocking();
         }
     }
 
     /**
-     * 抓取并更新pair交易对
+     * 处理待完成的交易（pending状态的交易）
      */
     public void handlerNewTxs(String transactionHash) throws IOException {
         //没有同步完成 先不处理
@@ -157,6 +180,7 @@ public class TransactionHandler extends WebSocketClient {
             return;
         }
         Optional<Transaction> transactionOptional = Web3.CLIENT.ethGetTransactionByHash(transactionHash).send().getTransaction();
+
         if (!transactionOptional.isPresent()) {
             return;
         }
@@ -165,6 +189,7 @@ public class TransactionHandler extends WebSocketClient {
         if (transaction == null) {
             return;
         }
+        //log.info("TransactionHandler.handlerNewTxs.transaction" + JSON.toJSONString(transaction));
         if ("0x".equals(transaction.getInput())) {
             return;
         }
@@ -180,11 +205,11 @@ public class TransactionHandler extends WebSocketClient {
         if (transaction.getBlockHash() != null) {
             return;
         }
-        //        if (transaction.getTo().equalsIgnoreCase("0xca4533591f5e5256f1bdb0f07fee3be76a1aae35")) {
-        //            log.info(transactionHash);
-        //        } else {
-        //            return;
-        //        }
+        if (transaction.getTo().equalsIgnoreCase("0xca4533591f5e5256f1bdb0f07fee3be76a1aae35")) {
+            log.info(transactionHash);
+        } else {
+            return;
+        }
         //tx 需要转为request
         org.web3j.protocol.core.methods.request.Transaction traceCallTx = org.web3j.protocol.core.methods.request.Transaction.createEthCallTransaction(transaction.getFrom(), transaction.getTo(), transaction.getInput());
         long startTime = System.currentTimeMillis();
@@ -196,9 +221,9 @@ public class TransactionHandler extends WebSocketClient {
         if (structLogs.size() < 3000) {
             return;
         }
-        //log.info("traceCall耗时：{}", System.currentTimeMillis() - startTime);
-        //log.info(String.valueOf(structLogs.size()));
-        //log.info(transaction.getRaw().toString());
+        log.info("traceCall耗时：{}", System.currentTimeMillis() - startTime);
+        log.info(String.valueOf(structLogs.size()));
+        log.info(transaction.getRaw().toString());
         for (int i = 0; i < structLogs.size(); i++) {
             JSONObject structLog = structLogs.getJSONObject(i);
             JSONArray pairStack = structLog.getJSONArray("stack");
@@ -221,7 +246,7 @@ public class TransactionHandler extends WebSocketClient {
                     break;
                 }
             }
-            //log.info("findPair耗时：{}", System.currentTimeMillis() - startTime);
+            log.info("findPair耗时：{}", System.currentTimeMillis() - startTime);
             //沒有這個交易對
             if (!PairsContainer.PAIRS.containsKey(pairAddress)) {
                 continue;
@@ -241,18 +266,18 @@ public class TransactionHandler extends WebSocketClient {
                     continue;
                 }
                 //找到目标sync方法参数
-                //log.info(syncStack.toString());
+                log.info(syncStack.toString());
                 //解析reserve信息
                 int startIndex = syncStack.indexOf("0xa4");
                 if (startIndex == -1) {
                     continue;
                 }
-                //log.info("findSync耗时：{}", System.currentTimeMillis() - startTime);
+                log.info("findSync耗时：{}", System.currentTimeMillis() - startTime);
                 BigInteger reserve0Before = Numeric.toBigInt(syncStack.getString(startIndex + 2));
                 BigInteger reserve1Before = Numeric.toBigInt(syncStack.getString(startIndex + 3));
                 BigInteger reserve0After = Numeric.toBigInt(syncStack.getString(startIndex + 4));
                 BigInteger reserve1After = Numeric.toBigInt(syncStack.getString(startIndex + 5));
-                //log.info(reserve0After.toString());
+                log.info(reserve0After.toString());
                 PairInfo pair = PairsContainer.PAIRS.get(pairAddress);
                 //如果是稳定币交易对则放弃
                 if (targetTokens.contains(pair.getToken0()) && targetTokens.contains(pair.getToken1())) {
@@ -275,7 +300,7 @@ public class TransactionHandler extends WebSocketClient {
                     return;
                 }
                 log.info("findArb耗时：{}", System.currentTimeMillis() - startTime);
-                //log.info(JSON.toJSONString(arbs));
+                log.info(JSON.toJSONString(arbs));
                 //使用所有交易对计算最优价格
                 Arb attackArb = null;
                 BigInteger optimalAmount = BigInteger.ZERO;
@@ -292,7 +317,7 @@ public class TransactionHandler extends WebSocketClient {
                             pairInfo.setReserve0(reserve0After);
                             pairInfo.setReserve1(reserve1After);
                             pairs.set(k, pairInfo);
-                            //log.info(JSON.toJSONString(PairsContainer.PAIRS.get(pairAddress)));
+                            log.info(JSON.toJSONString(PairsContainer.PAIRS.get(pairAddress)));
                             break;
                         }
                     }

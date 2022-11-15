@@ -71,6 +71,7 @@ public class PairsContainer extends WebSocketClient {
      */
     static {
         try {
+            //从文件里边读取交易对信息列表
             pairsSerializeFile = new File("." + File.separator + "pairs.json");
             PAIRS = JSON.parseObject(FileUtils.readFileToString(pairsSerializeFile, StandardCharsets.UTF_8), new TypeReference<ConcurrentHashMap<String, PairInfo>>() {
             });
@@ -98,6 +99,7 @@ public class PairsContainer extends WebSocketClient {
     @PostConstruct
     @Scheduled(initialDelay = 600 * 1000L, fixedDelay = 600 * 1000L)
     public void pairsSync() {
+        log.info("PairsContainer.pairsSync");
         new Thread(() -> {
             log.info("开始更新PairsReserves");
             Set<String> keySet = new HashSet<>(PAIRS.keySet());
@@ -169,12 +171,12 @@ public class PairsContainer extends WebSocketClient {
 
     @Override
     public void onClose(int code, String reason, boolean remote) {
-
+        log.info("PairsContainer.onClose");
     }
 
     @Override
     public void onError(Exception ex) {
-
+        log.info("PairsContainer.onError");
     }
 
     /**
@@ -184,14 +186,14 @@ public class PairsContainer extends WebSocketClient {
     public void heartBeat() throws InterruptedException {
         if (getReadyState() == READYSTATE.OPEN) {
         } else if (getReadyState() == READYSTATE.NOT_YET_CONNECTED) {
-            log.info("未连接重连");
+            log.info("PairsContainer.heartBeat.未连接重连");
             if (isClosed()) {
                 reconnectBlocking();
             } else {
                 connectBlocking();
             }
         } else if (getReadyState() == READYSTATE.CLOSED) {
-            log.info("已关闭重连");
+            log.info("PairsContainer.heartBeat.已关闭重连");
             reconnectBlocking();
         }
     }
@@ -200,14 +202,14 @@ public class PairsContainer extends WebSocketClient {
      * 抓取并更新pair交易对
      */
     public void handlerNewLogs(JSONObject result) {
-        //log.info(result.toString());
+        log.info("handlerNewLogs.result = " + result.toString());
         //获取到订阅结果，解析成对象
         Log syncLog = result.toJavaObject(Log.class);
         if ("0xe26e436084348edc0d5c7244903dd2cd2c560f88".equals(syncLog.getAddress()) || "0x96f6eb307dcb0225474adf7ed3af58d079a65ec9".equals(syncLog.getAddress()) || "0xcdaf38ced8bf28ae3a0730dc180703cf794bea59".equals(syncLog.getAddress())) {
             //这个不是pair交易对!
             return;
         }
-        //log.info(syncLog.getLogIndex().toString());
+        //log.info("handlerNewLogs.syncLog.getLogIndex() = " + syncLog.getLogIndex().toString());
         List<BigInteger> reserves = decodeSync(syncLog.getData());
         if (PAIRS.containsKey(syncLog.getAddress())) {
             //如果pair已经存在，则更新reserve信息
@@ -247,6 +249,7 @@ public class PairsContainer extends WebSocketClient {
      * 计算所有可进行的路径
      */
     public static void findArb(String tokenIn, String tokenOut, Integer maxHops, PairInfo targetPair, String targetIn, List<PairInfo> arb, List<Arb> arbs) {
+        log.info("PairsContainer.findArb");
         if (maxHops == 0) {
             return;
         }
@@ -283,6 +286,7 @@ public class PairsContainer extends WebSocketClient {
                 findArb(tempOut, tokenOut, maxHops - 1, targetPair, targetIn, newArb, arbs);
             }
         }
+        log.info("PairsContainer.findArb.end");
     }
 
     //获取bnb等价usdt
