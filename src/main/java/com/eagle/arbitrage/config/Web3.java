@@ -14,7 +14,7 @@ import java.math.BigInteger;
 public class Web3 {
 
     //客户端
-    public static Web3Client CLIENT = new Web3Client(new HttpService("https://mainnet.infura.io/v3/cd6d8ffccb944001a22756cbcc236f62"));
+    public static Web3Client CLIENT = new Web3Client(new HttpService("wss://eth-mainnet.g.alchemy.com/v2/Z_o2kAR_GFo2GnYl3s3RLktflk6TnZtg"));
 
     public static BigInteger GAS_PRICE;
 

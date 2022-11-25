@@ -33,6 +33,9 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 
+/**
+ * 通过WebSocket来进行交易对信息通信
+ */
 @Slf4j
 public class PairsContainer extends WebSocketClient {
 
@@ -42,8 +45,14 @@ public class PairsContainer extends WebSocketClient {
     private static ThreadPoolExecutor pairHandlerExecutor = new ThreadPoolExecutor(12, 24, 60, TimeUnit.MINUTES, new ArrayBlockingQueue<>(20000), new ThreadPoolExecutor.DiscardPolicy());
     private static ThreadPoolExecutor pairSyncExecutor = new ThreadPoolExecutor(4, 8, 60, TimeUnit.MINUTES, new ArrayBlockingQueue<>(20000), new ThreadPoolExecutor.DiscardPolicy());
 
+    /**
+     * 交易对信息文件
+     */
     private static File pairsSerializeFile;
 
+    /**
+     * 交易对信息
+     */
     public static Map<String, PairInfo> PAIRS;
 
     /**
@@ -62,6 +71,12 @@ public class PairsContainer extends WebSocketClient {
     private static PairInfo BNB_BUSD_PAIR;
 
 
+    /**
+     * 构造函数初始化
+     *
+     * @param serverUri     以太坊WebSocket地址
+     * @param protocolDraft WebSocket草案版本
+     */
     public PairsContainer(URI serverUri, Draft protocolDraft) {
         super(serverUri, protocolDraft);
     }
@@ -77,39 +92,52 @@ public class PairsContainer extends WebSocketClient {
             });
             BNB_BUSD_PAIR = PAIRS.get("0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae");
         } catch (IOException e) {
-            throw new BizException(BizCodeEnum.OPERATION_FAILED, "Pairs持久化文件不存在");
+            throw new BizException(BizCodeEnum.OPERATION_FAILED, "Pairs持久化文件读取失败");
         }
     }
 
     /**
-     * 序列化pair
+     * 序列化pair（100分钟序列化一次）
      *
      * @throws IOException
      */
-    @Scheduled(initialDelay = 6000 * 1000L, fixedDelay = 6000 * 1000L)
+    @Scheduled(
+            initialDelay = 6000 * 1000L, //初始启动间隔时长，单位毫秒
+            fixedDelay = 6000 * 1000L //间隔时长，单位毫秒
+    )
     public void pairsSerialize() throws IOException {
-        log.info("开始持久化Pairs数据");
         FileUtils.writeStringToFile(pairsSerializeFile, JSON.toJSONString(PAIRS), StandardCharsets.UTF_8);
-        log.info("持久化Pairs数据完毕");
+
     }
 
     /**
      * 更新pair (1.启动时候更新 2.每10分钟完全更新一次)
+     * //每隔10分钟，全量更新一次(基于已有的交易对信息)
      */
     @PostConstruct
-    @Scheduled(initialDelay = 600 * 1000L, fixedDelay = 600 * 1000L)
+    @Scheduled(initialDelay = 600 * 1000L, //初始启动间隔时长，单位毫秒
+            fixedDelay = 600 * 1000L  //间隔时长，单位毫秒
+    )
     public void pairsSync() {
-        log.info("PairsContainer.pairsSync");
+        //异步执行
         new Thread(() -> {
             log.info("开始更新PairsReserves");
             Set<String> keySet = new HashSet<>(PAIRS.keySet());
             CountDownLatch countDownLatch = new CountDownLatch(keySet.size());
+            //循环交易对信息进行更新
             for (String key : keySet) {
                 PairInfo pairInfo = PAIRS.get(key);
                 pairSyncExecutor.execute(() -> {
                     try {
-                        Pair pair = Pair.load(pairInfo.getAddress(), Web3.CLIENT, WalletConfig.OPERATOR_CREDENTIALS, null);
+                        //组装获取全量的交易对信息的请求
+                        Pair pair = Pair.load(
+                                pairInfo.getAddress(), //交易对合约的地址（需要调用合约里边的方法读取数据）
+                                Web3.CLIENT, //Web3操作对象
+                                WalletConfig.OPERATOR_CREDENTIALS,
+                                null);
+                        //发送请求，调用合约获取数据
                         Tuple3<BigInteger, BigInteger, BigInteger> reserves = pair.getReserves().send();
+                        //检查数据是否合法，数据格式：Mask(112, 0, stor8.field_0), Mask(112, 0, stor8.field_0), uint32(stor8.field_224)
                         if (pairInfo.getReserve0().compareTo(reserves.component1()) != 0 || pairInfo.getReserve1().compareTo(reserves.component2()) != 0) {
                             pairInfo.setUpdateTime(LocalDateTime.now());
                             pairInfo.setReserve0(reserves.component1());
@@ -124,6 +152,7 @@ public class PairsContainer extends WebSocketClient {
             try {
                 countDownLatch.await();
             } catch (InterruptedException e) {
+                log.error("同步全量交易对信息出现异常", e);
             }
             SYNC = true;
             log.info("PairsReserves更新完毕");
@@ -131,7 +160,18 @@ public class PairsContainer extends WebSocketClient {
     }
 
     /**
-     * 订阅logs
+     * WebSocket的打开链接事件回调
+     *
+     * @param data
+     */
+    @Override
+    public void onOpen(ServerHandshake data) {
+        //连接打开了之后，订阅SWAP事件消息
+        subscribeLogs();
+    }
+
+    /**
+     * 订阅dex中swap的logs消息（交易对的SWAP事件）
      */
     public void subscribeLogs() {
         HashMap<String, Object> request = new HashMap<>();
@@ -144,18 +184,22 @@ public class PairsContainer extends WebSocketClient {
         request.put("params", params);
         request.put("id", "eth_subscribe_newLogs");
         request.put("method", "eth_subscribe");
+        //通过WebSocket发送到Node订阅事件
         send(JSON.toJSONString(request));
     }
 
-    @Override
-    public void onOpen(ServerHandshake data) {
-        subscribeLogs();
-    }
-
+    /**
+     * WebSocket的消息通知回调
+     * 主要是处理SWAP的事件消息
+     *
+     * @param message
+     */
     @Override
     public void onMessage(String message) {
+        //解析推送过来的消息内容信息
         JSONObject result = JSON.parseObject(message);
         if (result.containsKey("id")) {
+            //当前信息是否为订阅的新交易记录信息
             if ("eth_subscribe_newLogs".equals(result.get("id"))) {
                 newLogsKey = result.getString("result");
             }
@@ -169,58 +213,41 @@ public class PairsContainer extends WebSocketClient {
         }
     }
 
-    @Override
-    public void onClose(int code, String reason, boolean remote) {
-        log.info("PairsContainer.onClose");
-    }
-
-    @Override
-    public void onError(Exception ex) {
-        log.info("PairsContainer.onError");
-    }
 
     /**
-     * 每30秒检测断开后重连
-     */
-    @Scheduled(initialDelay = 30_000, fixedDelay = 30_000)
-    public void heartBeat() throws InterruptedException {
-        if (getReadyState() == READYSTATE.OPEN) {
-        } else if (getReadyState() == READYSTATE.NOT_YET_CONNECTED) {
-            log.info("PairsContainer.heartBeat.未连接重连");
-            if (isClosed()) {
-                reconnectBlocking();
-            } else {
-                connectBlocking();
-            }
-        } else if (getReadyState() == READYSTATE.CLOSED) {
-            log.info("PairsContainer.heartBeat.已关闭重连");
-            reconnectBlocking();
-        }
-    }
-
-    /**
-     * 抓取并更新pair交易对
+     * 从消息内容里边读取SWAP信息
+     * 更新pair交易对
      */
     public void handlerNewLogs(JSONObject result) {
-        log.info("handlerNewLogs.result = " + result.toString());
         //获取到订阅结果，解析成对象
         Log syncLog = result.toJavaObject(Log.class);
         if ("0xe26e436084348edc0d5c7244903dd2cd2c560f88".equals(syncLog.getAddress()) || "0x96f6eb307dcb0225474adf7ed3af58d079a65ec9".equals(syncLog.getAddress()) || "0xcdaf38ced8bf28ae3a0730dc180703cf794bea59".equals(syncLog.getAddress())) {
             //这个不是pair交易对!
             return;
         }
-        //log.info("handlerNewLogs.syncLog.getLogIndex() = " + syncLog.getLogIndex().toString());
+
+        //解析交易对里边的资金池储存数量信息
         List<BigInteger> reserves = decodeSync(syncLog.getData());
+        //内存中的交易对信息是否包含了当前的交易对地址
         if (PAIRS.containsKey(syncLog.getAddress())) {
             //如果pair已经存在，则更新reserve信息
             //解析reserve信息
             PairInfo pairInfo = PAIRS.get(syncLog.getAddress());
+            //更新代币Token1的资金储藏量
             pairInfo.setReserve0(reserves.get(0));
+            //更新代币Token2的资金储藏量
             pairInfo.setReserve1(reserves.get(1));
+            //更新交易对的时间
             pairInfo.setUpdateTime(LocalDateTime.now());
         }
     }
 
+    /**
+     * 解析交易对里边的资金池储存数量信息
+     *
+     * @param encodeData 消息实体
+     * @return 返回交易对里边的资金池储存数量列表，列表中第一个为代币Token1的储存量，第二个为代币Token2的储存量
+     */
     public List<BigInteger> decodeSync(String encodeData) {
         String data = Numeric.cleanHexPrefix(encodeData);
         List<BigInteger> result = new ArrayList<>();
@@ -230,7 +257,7 @@ public class PairsContainer extends WebSocketClient {
     }
 
     /**
-     * 计算交易手续费
+     * 计算交易对交易手续费
      */
     private static BigInteger calPairFee(BigInteger amount0In, BigInteger amount1In, BigInteger amount0Out, BigInteger amount1Out, BigInteger reserve0, BigInteger reserve1) {
         BigInteger amount0 = amount0In.subtract(amount0Out);
@@ -247,37 +274,56 @@ public class PairsContainer extends WebSocketClient {
 
     /**
      * 计算所有可进行的路径
+     * 1、第一步匹配买入的代币Token
+     * 2、匹配全部
+     *
+     * @param tokenIn    买入的代币
+     * @param tokenOut   卖出的代币
+     * @param maxHops    比配的最大跳数
+     * @param targetPair 目标交易对
+     * @param targetIn   目标买入
+     * @param arb        中间临时存储的交易对信息
+     * @param arbs       匹配的交易对信息列表
      */
     public static void findArb(String tokenIn, String tokenOut, Integer maxHops, PairInfo targetPair, String targetIn, List<PairInfo> arb, List<Arb> arbs) {
         log.info("PairsContainer.findArb");
         if (maxHops == 0) {
             return;
         }
-        for (PairInfo pair : PAIRS.values()) {
-            if (!pair.getToken0().equalsIgnoreCase(tokenIn) && !pair.getToken1().equalsIgnoreCase(tokenIn)) {
+
+        //循环全部交易对，进行寻找
+        for (PairInfo currentPair : PAIRS.values()) {
+            //前和后都没有配上输入的代币，则循环下一个交易对
+            if (!currentPair.getToken0().equalsIgnoreCase(tokenIn) && !currentPair.getToken1().equalsIgnoreCase(tokenIn)) {
                 //1.如果这个交易对没有pairIn的信息，认为是不相关交易对
                 continue;
             }
+
             //如果当前pair已经在交易对中出现过则跳过
-            if (arb.contains(pair)) {
+            if (arb.contains(currentPair)) {
                 continue;
             }
-            if (pair.equals(targetPair)) {
+
+            if (currentPair.equals(targetPair)) {
                 //判断tokenIn是否一致
                 if (!tokenIn.equalsIgnoreCase(targetIn)) {
                     //买入卖出方向不一致。。视为无效数据
                     continue;
                 }
             }
-            //诞生新分支
-            ArrayList<PairInfo> newArb = new ArrayList<>(arb);
-            newArb.add(pair);
+
+            //叠加原来的交易对，诞生新分支
+            ArrayList<PairInfo> newArb = new ArrayList<>();
+            newArb.addAll(arb);
+            newArb.add(currentPair);
             //计算tokenIn tokenOut分别是什么
-            String tempOut = pair.getToken0().equalsIgnoreCase(tokenIn) ? pair.getToken1() : pair.getToken0();
+            String tempOut = currentPair.getToken0().equalsIgnoreCase(tokenIn) ? currentPair.getToken1() : currentPair.getToken0();
+            //确定是否已经找到合适的
             if (tempOut.equalsIgnoreCase(tokenOut) && newArb.contains(targetPair)) {
                 //加入arbs中
                 Arb targetArb = new Arb();
                 targetArb.setPairs(newArb);
+                //交易对的合约地址
                 targetArb.setToken(tokenOut);
                 arbs.add(targetArb);
                 return;
@@ -294,6 +340,13 @@ public class PairsContainer extends WebSocketClient {
         return getAmountOut("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", bnbAmountIn, BNB_BUSD_PAIR);
     }
 
+    /**
+     * 使用恒定乘积来计算输出拿到的Token的数量
+     * @param tokenIn 输入的代表
+     * @param amountIn 输入的代币数量
+     * @param pair 交易对
+     * @return 返回输出的代币数量
+     */
     public static BigInteger getAmountOut(String tokenIn, BigInteger amountIn, PairInfo pair) {
         BigInteger reserveIn = pair.getToken0().equalsIgnoreCase(tokenIn) ? pair.getReserve0() : pair.getReserve1();
         BigInteger reserveOut = pair.getToken0().equalsIgnoreCase(tokenIn) ? pair.getReserve1() : pair.getReserve0();
@@ -304,6 +357,12 @@ public class PairsContainer extends WebSocketClient {
         return amountOut;
     }
 
+    /**
+     * 根据资金池得到交易对列表组成的虚拟交易对的资金池代币数量
+     * @param tokenIn 输入资金池的代币Token（这里是稳定币）
+     * @param pairs 交易对路径列表
+     * @return
+     */
     public static List<BigInteger> calEaEb(String tokenIn, List<PairInfo> pairs) {
         String tokenOut = null;
         BigInteger ea = null;
@@ -311,25 +370,41 @@ public class PairsContainer extends WebSocketClient {
         for (int i = 0; i < pairs.size(); i++) {
             PairInfo pair = pairs.get(i);
             if (i == 0) {
+                //首个交易对，初始的时候，需要找到买入的代币Token（In的是稳定币），找到对应拿出来的代币Token
                 tokenOut = pair.getToken0().equalsIgnoreCase(tokenIn) ? pair.getToken1() : pair.getToken0();
             } else if (i == 1) {
-                PairInfo oldPair = pairs.get(i - 1);
-                BigInteger ra = oldPair.getToken0().equalsIgnoreCase(tokenIn) ? oldPair.getReserve0() : oldPair.getReserve1();
-                BigInteger rb = oldPair.getToken0().equalsIgnoreCase(tokenIn) ? oldPair.getReserve1() : oldPair.getReserve0();
-                BigInteger rb1 = pair.getToken0().equalsIgnoreCase(tokenOut) ? pair.getReserve0() : pair.getReserve1();
-                BigInteger rc = pair.getToken0().equalsIgnoreCase(tokenOut) ? pair.getReserve1() : pair.getReserve0();
+                PairInfo firstPair = pairs.get(i - 1);
+                //第一个交易对，收入的稳定币在资金池的总数
+                BigInteger preInReserve = firstPair.getToken0().equalsIgnoreCase(tokenIn) ? firstPair.getReserve0() : firstPair.getReserve1();
+                //第一个交易对，对应的输出代币的资金池数量
+                BigInteger preOutReserve = firstPair.getToken0().equalsIgnoreCase(tokenIn) ? firstPair.getReserve1() : firstPair.getReserve0();
+                //第二个交易对，输入的是上一轮的代币Token，这里读取资金池数量
+                BigInteger currentInReserve = pair.getToken0().equalsIgnoreCase(tokenOut) ? pair.getReserve0() : pair.getReserve1();
+                //第二个交易对，输出的Token的资金池数量
+                BigInteger currentOutReserve = pair.getToken0().equalsIgnoreCase(tokenOut) ? pair.getReserve1() : pair.getReserve0();
+
+                //denominator = 1000 * 当前轮次输入的代币资金池资金数量 + （（1000 - 交易手续费）* 上一轮的输出Token的资金池资金量）
+                BigInteger denominator = feeUnit.multiply(currentInReserve).add(feeUnit.subtract(pair.getFee()).multiply(preOutReserve));
+                // 1000 * 上一轮的输出Token的资金池资金量 * 当前轮次输入的代币资金池资金数量 / denominator
+                ea = feeUnit.multiply(preInReserve).multiply(currentInReserve).divide(denominator);
+                eb = feeUnit.subtract(pair.getFee()).multiply(preOutReserve).multiply(currentOutReserve).divide(denominator);
+
+                //得到第二轮的时候，输出的代币Token
                 tokenOut = pair.getToken0().equalsIgnoreCase(tokenOut) ? pair.getToken1() : pair.getToken0();
-                BigInteger denominator = feeUnit.multiply(rb1).add(feeUnit.subtract(pair.getFee()).multiply(rb));
-                ea = feeUnit.multiply(ra).multiply(rb1).divide(denominator);
-                eb = feeUnit.subtract(pair.getFee()).multiply(rb).multiply(rc).divide(denominator);
             } else {
-                BigInteger ra = ea;
-                BigInteger rb = eb;
+                BigInteger ra = ea;//使用上一轮计算的结果
+                BigInteger rb = eb;//使用上一轮计算的结果
+                //上一轮的交易对的输出Token的资金池资金数量，也就是当前轮的输入Token的资金池资金数量
                 BigInteger rb1 = pair.getToken0().equalsIgnoreCase(tokenOut) ? pair.getReserve0() : pair.getReserve1();
+                //当前轮输出的Token资金池资金数量
                 BigInteger rc = pair.getToken0().equalsIgnoreCase(tokenOut) ? pair.getReserve1() : pair.getReserve0();
+                //输出的Token
                 tokenOut = pair.getToken0().equalsIgnoreCase(tokenOut) ? pair.getToken1() : pair.getToken0();
+                // denominator = 1000 * 当前轮次输入的代币资金池资金数量 + （(1000 - 手续费) * eb）
                 BigInteger denominator = feeUnit.multiply(rb1).add(feeUnit.subtract(pair.getFee()).multiply(rb));
+                //ea = （1000 * 使用上一轮计算的ea结果 * 当前轮的输入Token的资金池资金数量 ） / denominator
                 ea = feeUnit.multiply(ra).multiply(rb1).divide(denominator);
+                //ba = (（1000 - 手续费) * 使用上一轮计算的结果 *当前轮输出的Token资金池资金数量 ） / denominator
                 eb = feeUnit.subtract(pair.getFee()).multiply(rb).multiply(rc).divide(denominator);
             }
         }
@@ -339,6 +414,13 @@ public class PairsContainer extends WebSocketClient {
         return result;
     }
 
+    /**
+     * 获取最理想的Amount输入值
+     * 参考：https://github.com/ccyanxyz/uniswap-arbitrage-analysis/blob/master/readme_zh.pdf
+     * @param tokenIn 输入的代币Token
+     * @param pairs 交易对列表
+     * @return 最理想的Amount输入值
+     */
     public static BigInteger getOptimalAmount(String tokenIn, List<PairInfo> pairs) {
         List<BigInteger> eaEb = calEaEb(tokenIn, pairs);
         BigInteger ea = eaEb.get(0);
@@ -346,6 +428,13 @@ public class PairsContainer extends WebSocketClient {
         return getOptimalAmount(ea, eb);
     }
 
+    /**
+     * 根据虚拟交易对，求最佳的输入Token值
+     * 参考：https://github.com/ccyanxyz/uniswap-arbitrage-analysis/blob/master/readme_zh.pdf
+     * @param ea 虚拟交易对Token1的资金数量
+     * @param eb 虚拟交易对Token2的资金数量
+     * @return 返回虚拟交易对，的最佳输入Token数量
+     */
     public static BigInteger getOptimalAmount(BigInteger ea, BigInteger eb) {
         if (ea.compareTo(eb) > 0) {
             return BigInteger.ZERO;
@@ -354,16 +443,68 @@ public class PairsContainer extends WebSocketClient {
         return optionAmount;
     }
 
+    /**
+     * 计算交易对列表中，每一个交易对的输出值
+     * @param tokenIn 输入的代币
+     * @param amountIn 输入的代币数量
+     * @param pairs 交易对
+     * @return 每一个交易对的输出值
+     */
     public static List<BigInteger> getAmountsOut(String tokenIn, BigInteger amountIn, List<PairInfo> pairs) {
         List<BigInteger> amountsOut = new ArrayList<>();
         for (PairInfo pair : pairs) {
+            //计算当前交易对在特定的输入下，可以拿到的代币输出量
             BigInteger amountOut = getAmountOut(tokenIn, amountIn, pair);
             amountsOut.add(amountOut);
+            //得到下一轮的输入代币Token
             tokenIn = pair.getToken0().equalsIgnoreCase(tokenIn) ? pair.getToken1() : pair.getToken0();
             amountIn = amountOut;
         }
         return amountsOut;
     }
 
+    /**
+     * WebSocket的关闭事件回调
+     *
+     * @param code   状态码
+     * @param reason 原因
+     * @param remote
+     */
+    @Override
+    public void onClose(int code, String reason, boolean remote) {
+        log.info("PairsContainer.onClose");
+    }
 
+    /**
+     * WebSocket的异常事件回调
+     *
+     * @param ex
+     */
+    @Override
+    public void onError(Exception ex) {
+        log.info("PairsContainer.onError");
+    }
+
+    /**
+     * 定时任务，定时30秒检测链接状态，若断开后进行重连
+     * 每30秒检测断开后重连
+     */
+    @Scheduled(initialDelay = 30_000, fixedDelay = 30_000)
+    public void heartBeat() throws InterruptedException {
+        if (getReadyState() == READYSTATE.OPEN) {
+            //正常状态
+        } else if (getReadyState() == READYSTATE.NOT_YET_CONNECTED) {
+            //是否已经关闭连接
+            if (isClosed()) {
+                //调用WebSocket重连方法进行重连
+                reconnectBlocking();
+            } else {
+                //非关闭，但状态异常，再次连接非重连
+                connectBlocking();
+            }
+        } else if (getReadyState() == READYSTATE.CLOSED) {
+            //重连
+            reconnectBlocking();
+        }
+    }
 }

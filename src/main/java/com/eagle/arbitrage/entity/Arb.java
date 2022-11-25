@@ -9,8 +9,14 @@ import java.util.List;
 @Setter
 public class Arb {
 
+    /**
+     *
+     */
     private String token;
 
+    /**
+     * 交易对路径信息
+     */
     List<PairInfo> pairs;
 
 }
