@@ -316,6 +316,7 @@ public class TransactionHandler extends WebSocketClient {
                 List<Arb> arbs = new ArrayList<>();
                 CountDownLatch countDownLatch = new CountDownLatch(targetTokens.size());
 
+
                 //寻找从稳定币开始，经过目标Token，再回到稳定币的闭环路径
                 for (String stableToken : targetTokens) {
                     //多线程寻找可套利的交易对路径
@@ -390,7 +391,6 @@ public class TransactionHandler extends WebSocketClient {
                         tempProfitAmount = tempOptimalAmountOut.subtract(tempOptimalAmount);
                     }
 
-                    //TODO 这里可能存在问题？？
                     //输入代币交换完了只有比和原来的代币数量大的话，就可能有利润空间
                     if (tempProfitAmount.compareTo(optimalProfitAmount) > 0) {
                         attackArb = arb;
